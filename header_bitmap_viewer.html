@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Header Bitmap Viewer + Image Converter (Adafruit Thermal)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #222; }
+    header { margin-bottom: 1rem; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+    label { font-weight: 600; }
+    input[type="number"] { width: 6rem; }
+    textarea { width: 100%; height: 10rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    canvas { image-rendering: pixelated; border: 1px solid #ccc; max-width: 100%; }
+    .muted { color: #666; font-size: .9rem; }
+    .actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+    .col { flex: 1 1 360px; min-width: 300px; }
+    button { padding: .5rem .75rem; }
+    fieldset { border: 1px solid #ddd; padding: 1rem; }
+    legend { padding: 0 .5rem; }
+  </style>
+  <script>
+    function parseHeader(text) {
+      const result = { width: null, height: null, bytes: [] };
+
+      // Try to find width/height defines (generic: first pair encountered)
+      const widthMatch = text.match(/#define\s+\w+_width\s+(\d+)/);
+      const heightMatch = text.match(/#define\s+\w+_height\s+(\d+)/);
+      if (widthMatch) result.width = parseInt(widthMatch[1], 10);
+      if (heightMatch) result.height = parseInt(heightMatch[1], 10);
+
+      // Extract the first C-array initializer block {...}
+      const arrayBlockMatch = text.match(/\{([\s\S]*?)\}/);
+      if (!arrayBlockMatch) throw new Error("Couldn't find data array block {...}");
+      const block = arrayBlockMatch[1];
+
+      // Collect hex bytes (0x??) or decimal bytes
+      const tokens = block.match(/0x[0-9a-fA-F]{1,2}|\b\d+\b/g) || [];
+      const bytes = tokens.map(tok => {
+        if (tok.startsWith('0x') || tok.startsWith('0X')) return parseInt(tok, 16) & 0xFF;
+        return (parseInt(tok, 10) & 0xFF);
+      });
+      result.bytes = bytes;
+      return result;
+    }
+
+    function renderToCanvas({ width, height, bytes }, canvas, fg = '#000', bg = '#fff') {
+      if (!width || !height) throw new Error('Missing width/height');
+      const ctx = canvas.getContext('2d');
+      canvas.width = width;
+      canvas.height = height;
+
+      // Create ImageData and set pixels
+      const imgData = ctx.createImageData(width, height);
+      const data = imgData.data;
+      const bytesPerRow = Math.ceil(width / 8);
+      const totalNeeded = bytesPerRow * height;
+
+      if (bytes.length < totalNeeded) {
+        console.warn(`Warning: byte array shorter than expected (${bytes.length} < ${totalNeeded}). Rendering what we have.`);
+      }
+
+      // Parse colors
+      function hexToRGBA(hex) {
+        let h = hex.replace('#','');
+        if (h.length === 3) h = h.split('').map(ch => ch + ch).join('');
+        const num = parseInt(h, 16);
+        return [(num >> 16) & 255, (num >> 8) & 255, num & 255, 255];
+      }
+      const FG = hexToRGBA(fg);
+      const BG = hexToRGBA(bg);
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const byteIndex = y * bytesPerRow + Math.floor(x / 8);
+          const bit = 7 - (x % 8);
+          const b = bytes[byteIndex] || 0;
+          const v = (b >> bit) & 1; // 1 = black, 0 = white (per converter)
+          const idx = (y * width + x) * 4;
+          const src = v ? FG : BG;
+          data[idx] = src[0];
+          data[idx+1] = src[1];
+          data[idx+2] = src[2];
+          data[idx+3] = src[3];
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+
+    async function handleFile(file) {
+      const text = await file.text();
+      const parsed = parseHeader(text);
+      const widthInput = document.getElementById('width');
+      const heightInput = document.getElementById('height');
+      if (parsed.width) widthInput.value = parsed.width;
+      if (parsed.height) heightInput.value = parsed.height;
+      const width = parseInt(widthInput.value, 10);
+      const height = parseInt(heightInput.value, 10);
+      parsed.width = width; parsed.height = height;
+      renderToCanvas(parsed, document.getElementById('canvas'));
+      document.getElementById('meta').textContent = `Parsed ${parsed.bytes.length} bytes; expected ${Math.ceil(width/8)*height}.`;
+    }
+
+    function handleText() {
+      try {
+        const text = document.getElementById('src').value;
+        const parsed = parseHeader(text);
+        const widthInput = document.getElementById('width');
+        const heightInput = document.getElementById('height');
+        if (parsed.width) widthInput.value = parsed.width;
+        if (parsed.height) heightInput.value = parsed.height;
+        const width = parseInt(widthInput.value, 10);
+        const height = parseInt(heightInput.value, 10);
+        parsed.width = width; parsed.height = height;
+        renderToCanvas(parsed, document.getElementById('canvas'));
+        document.getElementById('meta').textContent = `Parsed ${parsed.bytes.length} bytes; expected ${Math.ceil(width/8)*height}.`;
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    function downloadPNG() {
+      const canvas = document.getElementById('canvas');
+      const link = document.createElement('a');
+      link.download = 'bitmap.png';
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    }
+
+    function rerender() {
+      // Re-parse from textarea to allow manual tweaking
+      handleText();
+    }
+
+    // ---------------- Image -> Header converter ----------------
+    function sanitizeName(name) {
+      // convert to valid C identifier base
+      let base = (name || '').replace(/\.[^.]*$/, '');
+      base = base.replace(/[^A-Za-z0-9_]/g, '_');
+      if (!/^[A-Za-z_]/.test(base)) base = '_' + base;
+      return base || 'image';
+    }
+
+    function drawRotated(ctx, img, rotation) {
+      const w = img.width, h = img.height;
+      if (rotation === 90 || rotation === 270) {
+        ctx.canvas.width = h;
+        ctx.canvas.height = w;
+      } else {
+        ctx.canvas.width = w;
+        ctx.canvas.height = h;
+      }
+      ctx.save();
+      if (rotation === 90) {
+        ctx.translate(h, 0);
+        ctx.rotate(Math.PI / 2);
+      } else if (rotation === 180) {
+        ctx.translate(w, h);
+        ctx.rotate(Math.PI);
+      } else if (rotation === 270) {
+        ctx.translate(0, w);
+        ctx.rotate(3 * Math.PI / 2);
+      }
+      ctx.drawImage(img, 0, 0);
+      ctx.restore();
+    }
+
+    function resizeCanvasToMaxWidth(srcCanvas, maxWidth) {
+      const w = srcCanvas.width, h = srcCanvas.height;
+      if (w <= maxWidth) return srcCanvas;
+      const scale = maxWidth / w;
+      const dst = document.createElement('canvas');
+      dst.width = Math.round(w * scale);
+      dst.height = Math.round(h * scale);
+      const dctx = dst.getContext('2d');
+      dctx.imageSmoothingEnabled = true;
+      dctx.imageSmoothingQuality = 'high';
+      dctx.drawImage(srcCanvas, 0, 0, dst.width, dst.height);
+      return dst;
+    }
+
+    function padCanvasWidthToMultipleOf8(srcCanvas) {
+      const padW = (8 - (srcCanvas.width % 8)) % 8;
+      if (!padW) return srcCanvas;
+      const dst = document.createElement('canvas');
+      dst.width = srcCanvas.width + padW;
+      dst.height = srcCanvas.height;
+      const dctx = dst.getContext('2d');
+      dctx.fillStyle = '#fff';
+      dctx.fillRect(0, 0, dst.width, dst.height);
+      dctx.drawImage(srcCanvas, 0, 0);
+      return dst;
+    }
+
+    function toGrayscale(imgData) {
+      const { data, width, height } = imgData;
+      const gray = new Float32Array(width * height);
+      for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+        const r = data[i], g = data[i+1], b = data[i+2];
+        gray[j] = 0.299*r + 0.587*g + 0.114*b; // luminance
+      }
+      return gray;
+    }
+
+    function applyInvert(gray) {
+      for (let i = 0; i < gray.length; i++) gray[i] = 255 - gray[i];
+    }
+
+    function applyThreshold(gray, width, height, threshold) {
+      const bits = new Uint8Array(width * height);
+      for (let i = 0; i < gray.length; i++) bits[i] = gray[i] < threshold ? 1 : 0; // 1=black
+      return bits;
+    }
+
+    function applyFloydSteinbergDither(gray, width, height) {
+      const g = new Float32Array(gray);
+      const bits = new Uint8Array(width * height);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = y * width + x;
+          const old = g[i];
+          const newVal = old < 128 ? 0 : 255;
+          const err = old - newVal;
+          bits[i] = newVal === 0 ? 1 : 0; // 1 = black when newVal=0
+          if (x+1 < width) g[i+1] += err * 7/16;
+          if (y+1 < height) {
+            if (x > 0) g[i + width - 1] += err * 3/16;
+            g[i + width] += err * 5/16;
+            if (x+1 < width) g[i + width + 1] += err * 1/16;
+          }
+        }
+      }
+      return bits;
+    }
+
+    function bitsToBytes(bits, width, height) {
+      const bytesPerRow = Math.ceil(width / 8);
+      const out = new Uint8Array(bytesPerRow * height);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const bit = bits[y * width + x];
+          const byteIndex = y * bytesPerRow + (x >> 3);
+          const bitPos = 7 - (x & 7);
+          if (bit) out[byteIndex] |= (1 << bitPos);
+        }
+      }
+      return out;
+    }
+
+    function generateHeaderText(nameBase, width, height, bytes) {
+      const guard = `_${nameBase}_h_`;
+      let lines = [];
+      lines.push(`#ifndef ${guard}`);
+      lines.push(`#define ${guard}`);
+      lines.push('');
+      lines.push(`#define ${nameBase}_width ${width}`);
+      lines.push(`#define ${nameBase}_height ${height}`);
+      lines.push('');
+      lines.push(`static const uint8_t PROGMEM ${nameBase}_data[] = {`);
+      let row = [];
+      for (let i = 0; i < bytes.length; i++) {
+        row.push('0x' + bytes[i].toString(16).padStart(2, '0'));
+        if (row.length === 12) {
+          lines.push(row.join(', ') + ',');
+          row = [];
+        }
+      }
+      if (row.length) lines.push(row.join(', ') + ',');
+      lines.push('};');
+      lines.push('');
+      lines.push(`#endif // ${guard}`);
+      return lines.join('\n');
+    }
+
+    async function handleImageFile(file) {
+      const url = URL.createObjectURL(file);
+      const img = await new Promise((res, rej) => {
+        const im = new Image();
+        im.onload = () => res(im);
+        im.onerror = rej;
+        im.src = url;
+      });
+
+      const nameBase = sanitizeName(document.getElementById('img-name').value || file.name);
+      const maxWidth = parseInt(document.getElementById('img-maxwidth').value, 10) || 384;
+      const rotate = parseInt(document.getElementById('img-rotate').value, 10) || 0;
+      const invert = document.getElementById('img-invert').checked;
+      const dither = document.getElementById('img-dither').checked;
+      const threshold = parseInt(document.getElementById('img-threshold').value, 10);
+
+      const canvas1 = document.createElement('canvas');
+      let ctx1 = canvas1.getContext('2d');
+      drawRotated(ctx1, img, rotate);
+
+      const canvas2 = resizeCanvasToMaxWidth(canvas1, maxWidth);
+      const canvas3 = padCanvasWidthToMultipleOf8(canvas2);
+
+      const ctx3 = canvas3.getContext('2d');
+      const id = ctx3.getImageData(0, 0, canvas3.width, canvas3.height);
+      const gray = toGrayscale(id);
+      if (invert) applyInvert(gray);
+
+      let bits;
+      if (dither) bits = applyFloydSteinbergDither(gray, canvas3.width, canvas3.height);
+      else {
+        const T = isNaN(threshold) ? 128 : Math.max(0, Math.min(255, threshold));
+        bits = applyThreshold(gray, canvas3.width, canvas3.height, T);
+      }
+
+      const bytes = bitsToBytes(bits, canvas3.width, canvas3.height);
+      const headerText = generateHeaderText(nameBase, canvas3.width, canvas3.height, bytes);
+
+      renderToCanvas({ width: canvas3.width, height: canvas3.height, bytes }, document.getElementById('canvas'));
+      document.getElementById('meta').textContent = `Generated ${bytes.length} bytes for ${canvas3.width}x${canvas3.height}.`;
+      document.getElementById('out-header').value = headerText;
+    }
+
+    function downloadHeader() {
+      const text = document.getElementById('out-header').value;
+      if (!text) return alert('Nothing to download. Convert an image first.');
+      const nameBase = sanitizeName(document.getElementById('img-name').value || 'image');
+      const blob = new Blob([text], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = nameBase + '.h';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+  </head>
+<body>
+  <header>
+    <h1>Header Bitmap Viewer</h1>
+    <p class="muted">Loads Adafruit Thermal printBitmap-style headers and renders them. Use the converter below to build headers from images.</p>
+  </header>
+
+  <section class="row">
+    <div class="col">
+      <label for="file">Load .h file:</label>
+      <input id="file" type="file" accept=".h,.hpp,.txt" />
+      <div class="muted">After selecting, it auto-renders.</div>
+      <br/><br/>
+      <label for="src">Or paste header contents:</label>
+      <textarea id="src" placeholder="Paste your header here..."></textarea>
+      <div class="actions">
+        <button onclick="handleText()">Render From Text</button>
+        <button onclick="downloadPNG()">Download PNG</button>
+      </div>
+    </div>
+    <div class="col">
+      <div class="row">
+        <div>
+          <label for="width">Width</label>
+          <input id="width" type="number" value="384" min="1" step="1" onchange="rerender()" />
+        </div>
+        <div>
+          <label for="height">Height</label>
+          <input id="height" type="number" value="256" min="1" step="1" onchange="rerender()" />
+        </div>
+      </div>
+      <p id="meta" class="muted"></p>
+      <canvas id="canvas"></canvas>
+    </div>
+  </section>
+
+  <hr/>
+
+  <header>
+    <h2>Image → Header Converter</h2>
+    <p class="muted">Convert PNG/JPG to a `.h` file for `printBitmap()`. Scales to width, pads to multiple of 8, optional invert/rotate/dither.</p>
+  </header>
+
+  <section class="row">
+    <div class="col">
+      <fieldset>
+        <legend>Source Image</legend>
+        <label for="img-file">Select image:</label>
+        <input id="img-file" type="file" accept="image/*" />
+      </fieldset>
+      <fieldset>
+        <legend>Options</legend>
+        <div class="row">
+          <div>
+            <label for="img-name">Base name</label>
+            <input id="img-name" type="text" placeholder="pic" />
+          </div>
+          <div>
+            <label for="img-maxwidth">Max width</label>
+            <input id="img-maxwidth" type="number" value="384" min="8" step="8" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="img-rotate">Rotate</label>
+            <select id="img-rotate">
+              <option value="0">0°</option>
+              <option value="90">90°</option>
+              <option value="180">180°</option>
+              <option value="270">270°</option>
+            </select>
+          </div>
+          <div>
+            <label for="img-threshold">Threshold</label>
+            <input id="img-threshold" type="number" value="128" min="0" max="255" />
+          </div>
+        </div>
+        <div class="row">
+          <label><input id="img-dither" type="checkbox" /> Dither (Floyd–Steinberg)</label>
+          <label><input id="img-invert" type="checkbox" /> Invert</label>
+        </div>
+        <div class="actions">
+          <button id="btn-convert">Convert Image</button>
+          <button id="btn-download" type="button" onclick="downloadHeader()">Download .h</button>
+        </div>
+      </fieldset>
+    </div>
+    <div class="col">
+      <label for="out-header">Generated header:</label>
+      <textarea id="out-header" placeholder="#define name_width ...\n..."></textarea>
+    </div>
+  </section>
+
+  <script>
+    document.getElementById('file').addEventListener('change', (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (file) handleFile(file).catch(err => alert(err.message));
+    });
+
+    document.getElementById('img-file').addEventListener('change', (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (file) handleImageFile(file).catch(err => alert(err.message));
+    });
+
+    document.getElementById('btn-convert').addEventListener('click', (ev) => {
+      ev.preventDefault();
+      const fileInput = document.getElementById('img-file');
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return alert('Select an image first.');
+      handleImageFile(file).catch(err => alert(err.message));
+    });
+  </script>
+</body>
+</html>
